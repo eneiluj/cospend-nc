@@ -4254,6 +4254,197 @@ class ProjectService {
     }
 
     /**
+     * Import a CSV file exported by Splid (https://splid.app/)
+     * Manually has to be converted from XLS to CSV first
+     */
+    public function importSplidCsvProject($path, $userId)
+    {
+        $cleanPath = str_replace(array('../', '..\\'), '',  $path);
+        $userFolder = \OC::$server->getUserFolder($userId);
+        if ($userFolder->nodeExists($cleanPath)) {
+            $file = $userFolder->get($cleanPath);
+            if ($file->getType() === \OCP\Files\FileInfo::TYPE_FILE) {
+                if (($handle = $file->fopen('r')) !== false) {
+                    $data = null;
+                    $members = [];
+                    $bills = [];
+                    $currencies = [];
+                    $mainCurrencyName = null;
+                    $row = 0;
+                    $getLine = function () {
+                        global $data;
+                        global $handle;
+                        $data = fgetcsv($handle, 1000, ',');
+                    };
+                    //row 0: [project name] — [export date]
+                    $getLine();
+                    if (count($data) === 1 and substr_count($data[0], '—') === 1) {
+                        $projectName = explode('—', $data[0], 2)[0];
+                    } else {
+                        return ['message' => $this->trans->t('Malformed CSV, unexpected entries at line 1')];
+                    }
+                    //row 1: [Created with] Splid (splid.app)
+                    $getLine();
+                    if (substr_count($data[0], 'Splid (splid.app)') !== 1) {
+                        return ['message' => $this->trans->t('Malformed CSV, unexpected entries at line 2')];
+                    }
+                    // row 2: empty
+                    $getLine();
+                    if ($data !== [null]) {
+                        return ['message' => $this->trans->t('Malformed CSV, unexpected entries at line 3')];
+                    }
+                    // row 3: column definitions
+                    // Titel | Betrag | Währung | Von | Datum | Erstellt am | [Person] | [empty] | [Person] | [empty] ...
+                    $getLine();
+                    if (count($data) >= 8 and
+                        $data[0] === 'Titel' and
+                        $data[1] === 'Betrag' and
+                        $data[2] === 'Währung' and
+                        $data[3] === 'Von' and
+                        $data[4] === 'Datum' and
+                        $data[5] === 'Erstellt am'
+                    ) {
+                        for ($i = 6; $i < count($data); $i += 2) {
+                            if (!empty($data[$i]) and empty($data[$i+1])) {
+                                // add members
+                                $members[$i] = $data[$i];
+                            } else {
+                                return ['message' => $this->trans->t('Malformed CSV, bad column names at line 4')];
+                            }
+                        }
+                    } else {
+                        return ['message' => $this->trans->t('Malformed CSV, bad column names at line 4')];
+                    }
+
+                    while ($getLine() && $data !== false) {
+                        $what = $data[0];
+                        $amount = $data[1];
+                        $currency = $data[2];
+                        if (array_key_exists($currency, $currencies)) {
+                            $currencies[$currency] += 1;
+                        } else {
+                            $currencies[$currency] = 1;
+                        }
+                        $payer_name = $data[3];
+                        // prefer explicit date over creation date
+                        if ($data[4] !== '–' and strtotime($data[4]) !== false) {
+                            $timestamp = strtotime($data[4]);
+                        } else if (strtotime($data[5]) !== false) {
+                            $timestamp = strtotime($data[5]);
+                        }
+                        $owers = $data[$columns['owers']];
+
+                        $owersArray = explode(', ', $owers);
+                        foreach ($owersArray as $ower) {
+                            if (strlen($ower) === 0) {
+                                fclose($handle);
+                                return ['message' => $this->trans->t('Malformed CSV, bad owers on line %1$s', [$row + 1])];
+                            }
+                        }
+                        if (!is_numeric($amount)) {
+                            fclose($handle);
+                            return ['message' => $this->trans->t('Malformed CSV, bad amount on line %1$s', [$row + 1])];
+                        }
+                        array_push($bills, [
+                            'what' => $what,
+                            'timestamp' => $timestamp,
+                            'amount' => $amount,
+                            'payer_name' => $payer_name,
+                            'owers' => $owersArray,
+                        ]);
+                        $row++;
+                    }
+                    fclose($handle);
+
+                    // guess primary currency by amount of usage
+                    $max = 0;
+                    foreach ($currencies as $currency => $frequency) {
+                        if ($frequency > $max) {
+                            $max = $frequency;
+                            $mainCurrencyName = $currency;
+                        }
+                    }
+
+                    $memberNameToId = [];
+
+                    // add project
+                    $user = $this->userManager->get($userId);
+                    $userEmail = $user->getEMailAddress();
+                    $projectid = slugify($projectName);
+                    $projResult = $this->createProject(
+                        $projectName,
+                        $projectid,
+                        '',
+                        $userEmail,
+                        $userId,
+                        true
+                    );
+                    if (!is_string($projResult)) {
+                        return ['message' => $this->trans->t('Error in project creation, %1$s', [$projResult['message']])];
+                    }
+                    // set project main currency
+                    if ($mainCurrencyName !== null) {
+                        $this->editProject($projectid, $projectName, null, null, null, $mainCurrencyName);
+                    }
+                    // add currencies
+                    foreach ($currencies as $cur => $frequency) {
+                        $insertedCurId = $this->addCurrency($projectid, $cur['name'], 1); //TODO: Default exchange rate
+                        if (!is_numeric($insertedCurId)) {
+                            $this->deleteProject($projectid);
+                            return ['message' => $this->trans->t('Error when adding currency %1$s', [$cur['name']])];
+                        }
+                    }
+                    // add members
+                    foreach ($members as $memberName) {
+                        $insertedMember = $this->addMember($projectid, $memberName, 1);
+                        if (!is_array($insertedMember)) {
+                            $this->deleteProject($projectid);
+                            return ['message' => $this->trans->t('Error when adding member %1$s', [$memberName])];
+                        }
+                        $memberNameToId[$memberName] = $insertedMember['id'];
+                    }
+                    // add bills
+                    foreach ($bills as $bill) {
+                        $payerId = $memberNameToId[$bill['payer_name']];
+                        $owerIds = [];
+                        foreach ($bill['owers'] as $owerName) {
+                            array_push($owerIds, $memberNameToId[$owerName]);
+                        }
+                        $owerIdsStr = implode(',', $owerIds);
+                        $addBillResult = $this->addBill(
+                            $projectid,
+                            null,
+                            $bill['what'],
+                            $payerId,
+                            $owerIdsStr,
+                            $bill['amount'],
+                            'n',
+                            null,
+                            null,
+                            0,
+                            null,
+                            $bill['timestamp'],
+                            null
+                        );
+                        if (!is_numeric($addBillResult)) {
+                            $this->deleteProject($projectid);
+                            return ['message' => $this->trans->t('Error when adding bill %1$s', [$bill['what']])];
+                        }
+                    }
+
+                    return $projectid;
+                } else {
+                    return ['message' => $this->trans->t('Access denied')];
+                }
+            } else {
+                return ['message' => $this->trans->t('Access denied')];
+            }
+        } else {
+            return ['message' => $this->trans->t('Access denied')];
+        }
+    }
+
+    /**
      * @NoAdminRequired
      */
     public function importSWProject($path, $userId) {
